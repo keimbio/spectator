@@ -3,826 +3,359 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Brush Studio</title>
+<title>Creative File Previewer</title>
+<!--
+  ─────────────────────────────────────────────────────────────────────────
+  CREATIVE FILE PREVIEWER  ·  proof-of-concept rendering core
+  ─────────────────────────────────────────────────────────────────────────
+  Previews Procreate + Adobe creative files in the browser, with NO native
+  app and NO server. Everything runs client-side.
+
+  WHY THIS IS THE HARD-PART-MADE-EASY:
+  Procreate files (.procreate .brush .brushset .swatches) are just ZIP
+  archives. Procreate embeds a ready-to-use PNG at "QuickLook/Thumbnail.png"
+  — the exact image Finder shows, and the exact image Prospect reads. So the
+  whole "preview" problem reduces to: unzip → grab the PNG. No LZO, no
+  NSKeyedArchiver, none of the heavy Silica-layer reconstruction in Prospect.
+
+  The parser functions below are written to be lifted verbatim into either
+  a Chrome extension content script OR a Google Drive "Open with" web app.
+  They take an ArrayBuffer and return a data structure / blob URL — no DOM
+  dependency in the parse layer.
+
+  Libraries (loaded from CDN):
+   - JSZip            (cdnjs)    — ZIP reading for all Procreate formats
+   - ag-psd           (jsdelivr) — lazy-loaded only when a .psd is opened
+   - pdf.js           (cdnjs)    — lazy-loaded only for modern (PDF-based) .ai
+  ─────────────────────────────────────────────────────────────────────────
+-->
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400&family=Spline+Sans+Mono:wght@400;500&display=swap" rel="stylesheet" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <style>
-  :root{
-    --bg:#0c0d10; --elevated:#15171e; --surface:#1a1d25; --surface2:#13151b;
-    --ink:#D8D8D8; --muted:#8b91a0; --faint:#5d636f;
-    --stroke:#262a35; --stroke2:#333949;
-    --gold:#c8a45a; --gold-dim:#9c7f44; --steel:#6b8fb5; --steel2:#5b7fa6; --steel-dim:#4d6a8c;
-    --good:#7faf86; --warn:#cf9b5a; --bad:#c8645a;
-    --shadow:0 18px 40px rgba(0,0,0,.45); --shadow-soft:0 10px 22px rgba(0,0,0,.4);
-    --fs:15px;
+  :root {
+    --bg: #15120e;
+    --bg-2: #1d1812;
+    --panel: #211b14;
+    --ink: #f4ece0;
+    --ink-dim: #b6a88f;
+    --line: #3a3026;
+    --accent: #d98a3d;       /* warm ochre */
+    --accent-2: #7fa6a0;     /* faded verdigris */
+    --paper: #efe6d6;
+    --danger: #c96a5a;
+    --radius: 10px;
   }
-  *{box-sizing:border-box}
-  html,body{margin:0;min-height:100%}
-  body{
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
     background:
-      radial-gradient(1100px 520px at 88% -8%,#16191f 0%,transparent 60%),
-      radial-gradient(840px 460px at -6% 108%,#14181c 0%,transparent 55%),
+      radial-gradient(1200px 600px at 80% -10%, #271f16 0%, transparent 60%),
+      radial-gradient(900px 500px at -10% 110%, #1c2420 0%, transparent 55%),
       var(--bg);
-    color:var(--ink); font-family:"Hanken Grotesk",system-ui,sans-serif; font-size:var(--fs);
-    line-height:1.55; -webkit-font-smoothing:antialiased;
+    color: var(--ink);
+    font-family: "Spline Sans Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
   }
-  .mono{font-family:"JetBrains Mono",ui-monospace,monospace}
-  a{color:var(--steel);text-decoration:none}
-  .page{max-width:1080px;margin:0 auto;padding:26px 22px 40px}
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 40px 28px 80px; }
 
-  /* Topbar */
-  .topbar{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:24px}
-  .brand{display:flex;align-items:center;gap:12px}
-  .brand-mark{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;
-    background:linear-gradient(135deg,var(--gold),var(--steel2));color:#0b0d10;font-weight:800;font-size:17px;
-    box-shadow:var(--shadow-soft)}
-  .brand-text{display:flex;align-items:baseline;gap:8px}
-  .brand-title{font-size:22px;font-weight:700;letter-spacing:-.01em}
-  .brand-sub{font-size:22px;font-weight:700;color:var(--gold);letter-spacing:-.01em}
-  .topbar-actions{display:flex;align-items:center;gap:12px}
-  .fontseg{display:flex;align-items:center;gap:8px}
-  .fontseg .lbl{font-family:"JetBrains Mono",monospace;font-size:10px;letter-spacing:.16em;color:var(--faint)}
+  header { margin-bottom: 26px; }
+  .kicker {
+    font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 8px;
+  }
+  h1 {
+    font-family: "Fraunces", Georgia, serif;
+    font-weight: 600; font-size: 38px; line-height: 1.05;
+    margin: 0 0 8px; letter-spacing: -0.01em;
+  }
+  .sub { color: var(--ink-dim); max-width: 62ch; margin: 0; font-size: 13px; }
+  .sub code { color: var(--accent-2); }
 
-  /* Buttons */
-  .btn{font-family:"Hanken Grotesk",sans-serif;font-size:13.5px;font-weight:600;cursor:pointer;border-radius:11px;
-    padding:9px 15px;border:1px solid var(--stroke2);background:var(--surface);color:var(--ink);transition:.15s;white-space:nowrap;
-    display:inline-flex;align-items:center;gap:8px}
-  .btn:hover{border-color:var(--gold-dim)}
-  .btn.ghost{background:transparent;color:var(--muted)}
-  .btn.ghost:hover{color:var(--ink);border-color:var(--gold-dim)}
-  .btn.primary{background:var(--steel2);border-color:var(--steel2);color:#0b0f14}
-  .btn.primary:hover{filter:brightness(1.08)}
-  .btn.gold{background:var(--gold);border-color:var(--gold);color:#15120a}
-  .btn:disabled{opacity:.4;cursor:not-allowed}
-  .btn.sm{padding:6px 11px;font-size:12.5px;border-radius:9px}
+  /* Drop zone */
+  .drop {
+    margin-top: 26px;
+    border: 1.5px dashed var(--line);
+    border-radius: var(--radius);
+    background: linear-gradient(180deg, var(--bg-2), var(--panel));
+    padding: 48px 24px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .18s ease, background .18s ease, transform .18s ease;
+  }
+  .drop:hover { border-color: var(--accent); }
+  .drop.drag { border-color: var(--accent); background: #2a2118; transform: translateY(-1px); }
+  .drop .big { font-family: "Fraunces", Georgia, serif; font-size: 20px; }
+  .drop .small { color: var(--ink-dim); font-size: 12px; margin-top: 8px; }
+  .drop .formats {
+    margin-top: 16px; display: flex; gap: 8px; flex-wrap: wrap; justify-content: center;
+  }
+  .chip {
+    font-size: 11px; padding: 3px 9px; border: 1px solid var(--line);
+    border-radius: 999px; color: var(--ink-dim);
+  }
+  .chip.on { color: var(--bg); background: var(--accent-2); border-color: var(--accent-2); }
+  input[type=file] { display: none; }
 
-  .seg{display:inline-flex;border:1px solid var(--stroke2);border-radius:999px;overflow:hidden}
-  .seg .opt{font-family:"JetBrains Mono",monospace;font-size:12px;padding:5px 11px;cursor:pointer;color:var(--muted);border-right:1px solid var(--stroke2);user-select:none}
-  .seg .opt:last-child{border-right:none}
-  .seg .opt.on{background:var(--gold);color:#15120a;font-weight:700}
+  /* Results */
+  #out { margin-top: 30px; display: grid; gap: 18px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .card-head {
+    display: flex; align-items: baseline; gap: 12px;
+    padding: 13px 16px; border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, #251e16, transparent);
+  }
+  .card-head .name {
+    font-family: "Fraunces", Georgia, serif; font-size: 16px;
+    overflow-wrap: anywhere;
+  }
+  .card-head .tag {
+    margin-left: auto; font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--bg); background: var(--accent); padding: 2px 8px; border-radius: 4px;
+    white-space: nowrap;
+  }
+  .card-body { padding: 16px; }
+  .meta { color: var(--ink-dim); font-size: 12px; margin-top: 10px; }
+  .meta b { color: var(--ink); font-weight: 500; }
 
-  /* Panel */
-  .panel{background:var(--elevated);border:1px solid var(--stroke2);border-radius:20px;padding:22px;box-shadow:var(--shadow);
-    animation:rise .5s ease both}
-  @keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-  .panel-header{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:18px;flex-wrap:wrap}
-  .panel-heading h2{margin:0 0 4px;font-size:19px;font-weight:700}
-  .panel-heading .hint{margin:0;color:var(--muted);font-size:13px}
-  .panel-heading .counts{margin-top:7px;font-family:"JetBrains Mono",monospace;font-size:11.5px;color:var(--faint)}
-  .panel-heading .counts b{color:var(--gold)}
-  .panel-actions{display:flex;flex-wrap:wrap;gap:9px;justify-content:flex-end;align-items:center}
+  /* checkerboard so transparency reads correctly, like an image viewer */
+  .checker {
+    background-color: #2a2620;
+    background-image:
+      linear-gradient(45deg, #1c1813 25%, transparent 25%),
+      linear-gradient(-45deg, #1c1813 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #1c1813 75%),
+      linear-gradient(-45deg, transparent 75%, #1c1813 75%);
+    background-size: 18px 18px;
+    background-position: 0 0, 0 9px, 9px -9px, -9px 0;
+    border-radius: 6px;
+    padding: 10px;
+    display: inline-block;
+    max-width: 100%;
+  }
+  .checker img { display: block; max-width: 100%; max-height: 460px; border-radius: 3px; }
 
-  /* Brush grid */
-  #brush-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:14px}
-  .card{background:var(--surface);border:1px solid var(--stroke);border-radius:15px;overflow:hidden;transition:.15s}
-  .card.sel{border-color:var(--gold);box-shadow:0 0 0 1px var(--gold) inset}
-  .thumb{position:relative;aspect-ratio:1/1;display:flex;align-items:center;justify-content:center;cursor:pointer;
-    background-color:#0a0b0d;
-    background-image:linear-gradient(45deg,#16181d 25%,transparent 25%),linear-gradient(-45deg,#16181d 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#16181d 75%),linear-gradient(-45deg,transparent 75%,#16181d 75%);
-    background-size:16px 16px;background-position:0 0,0 8px,8px -8px,-8px 0}
-  .thumb img{max-width:90%;max-height:90%;object-fit:contain}
-  .thumb .none{color:var(--faint);font-family:"JetBrains Mono",monospace;font-size:11px}
-  .badge{position:absolute;top:8px;left:8px;font-family:"JetBrains Mono",monospace;font-size:9px;letter-spacing:.12em;text-transform:uppercase;padding:2px 7px;border-radius:6px;background:#000a;border:1px solid var(--stroke2);color:var(--muted)}
-  .badge.pro{color:var(--gold);border-color:var(--gold-dim)} .badge.abr{color:var(--steel);border-color:var(--steel-dim)}
-  .chk{position:absolute;top:7px;right:7px;width:22px;height:22px;border-radius:7px;border:1.5px solid var(--stroke2);background:#000a;display:grid;place-items:center;color:transparent;font-weight:800;cursor:pointer;font-size:12px}
-  .card.sel .chk{background:var(--gold);border-color:var(--gold);color:#15120a}
-  .card .foot{padding:9px 11px;border-top:1px solid var(--stroke);display:flex;align-items:center;gap:8px}
-  .card .nm{flex:1;min-width:0;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .card .src{font-family:"JetBrains Mono",monospace;font-size:9.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .iconbtn{flex-shrink:0;width:26px;height:26px;border-radius:8px;border:1px solid var(--stroke2);display:grid;place-items:center;cursor:pointer;color:var(--muted);font-family:"JetBrains Mono",monospace;font-weight:700;font-size:12px}
-  .iconbtn:hover{color:var(--steel);border-color:var(--steel-dim)}
-  .empty{padding:54px 0;text-align:center;color:var(--faint);font-family:"JetBrains Mono",monospace;font-size:13px}
-  .empty .hl{color:var(--gold);cursor:pointer;text-decoration:underline}
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .grid .cell { background: #17130d; border: 1px solid var(--line); border-radius: 8px; padding: 8px; text-align: center; }
+  .grid .cell img { width: 100%; height: 110px; object-fit: contain; }
+  .grid .cell .cap { font-size: 10px; color: var(--ink-dim); margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  /* Modal */
-  .modal{position:fixed;inset:0;display:none;place-items:center;z-index:30;padding:22px}
-  .modal.show{display:grid}
-  .modal-backdrop{position:absolute;inset:0;background:#000b;backdrop-filter:blur(5px)}
-  .modal-card{position:relative;width:min(560px,94vw);max-height:88vh;overflow:auto;background:var(--elevated);
-    border:1px solid var(--stroke2);border-radius:18px;box-shadow:var(--shadow)}
-  .modal-card.wide{width:min(720px,94vw)}
-  .modal-head{position:sticky;top:0;background:var(--elevated);border-bottom:1px solid var(--stroke);padding:16px 20px;display:flex;align-items:center;gap:12px;z-index:2}
-  .modal-head h3{margin:0;font-size:17px;font-weight:700;flex:1}
-  .modal-head .hint{margin:2px 0 0;font-size:12px;color:var(--muted);font-weight:400}
-  .modal-body{padding:18px 20px}
+  .swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 10px; }
+  .swatch { border-radius: 8px; overflow: hidden; border: 1px solid var(--line); }
+  .swatch .chipcolor { height: 58px; }
+  .swatch .hex { font-size: 10px; padding: 4px 6px; color: var(--ink-dim); text-align: center; background: #17130d; }
 
-  /* Import dropzone (small, inside modal) */
-  .dropzone{border:2px dashed var(--stroke2);border-radius:14px;padding:30px 18px;text-align:center;background:var(--surface2);cursor:pointer;transition:.15s}
-  .dropzone:hover,.dropzone.drag{border-color:var(--gold);background:#1b1d16}
-  .dropzone p{margin:0;font-weight:600}
-  .dropzone span{color:var(--muted);font-size:12.5px}
-  .dropzone input{display:none}
-  .modal .note{font-size:12px;color:var(--faint);margin-top:12px;line-height:1.5}
-  .modal .note.warn{color:var(--warn)}
+  canvas { max-width: 100%; max-height: 460px; height: auto; border-radius: 3px; display:block; }
 
-  /* Export sections + tiles */
-  .xsec{margin-bottom:20px}
-  .xsec-head{margin-bottom:10px}
-  .xsec-head h4{margin:0 0 2px;font-size:13.5px;font-weight:700}
-  .xsec-head .hint{margin:0;font-size:12px;color:var(--muted)}
-  .tilegrid{display:grid;gap:10px}
-  .tilegrid.f{grid-template-columns:repeat(auto-fit,minmax(96px,1fr))}
-  .tilegrid.a{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}
-  .tile{position:relative;cursor:pointer}
-  .tile input{position:absolute;opacity:0;pointer-events:none}
-  .tile .tc{display:grid;gap:6px;justify-items:center;text-align:center;padding:13px 10px;border-radius:13px;border:1px solid var(--stroke);background:var(--surface);transition:.15s}
-  .tile .ti{width:36px;height:36px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(135deg,var(--gold),var(--steel2));color:#0b0d10;font-family:"JetBrains Mono",monospace;font-weight:800;font-size:11px;letter-spacing:.04em}
-  .tile .tt{font-weight:600;font-size:12.5px}
-  .tile input:checked + .tc{border-color:var(--gold);box-shadow:0 8px 20px rgba(200,164,90,.16);transform:translateY(-1px)}
-  .actiontile{border:1px solid var(--stroke);background:var(--surface);border-radius:13px;padding:13px 12px;display:grid;gap:7px;justify-items:center;text-align:center;cursor:pointer;transition:.15s;color:inherit;font:inherit}
-  .actiontile:hover{border-color:var(--gold-dim);transform:translateY(-1px)}
-  .actiontile .ti{width:34px;height:34px}
-  .actiontile .tt{font-weight:600;font-size:12.5px}
-  .actiontile .ts{font-size:10.5px;color:var(--muted)}
+  .note { color: var(--ink-dim); font-size: 12px; }
+  .err { color: var(--danger); }
+  .spin { display:inline-block; width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px;margin-right:7px;}
+  @keyframes s { to { transform: rotate(360deg); } }
 
-  .optrow{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:12px 0}
-  .check{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);cursor:pointer}
-  .check input{accent-color:var(--gold)}
-  .ifield{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--faint);font-family:"JetBrains Mono",monospace}
-  input[type=text]{background:var(--bg);border:1px solid var(--stroke2);color:var(--ink);border-radius:8px;padding:7px 10px;font-family:"JetBrains Mono",monospace;font-size:12px}
-  input[type=text].num{width:72px}
-  .xfoot{display:flex;justify-content:flex-end;gap:10px;border-top:1px solid var(--stroke);padding-top:14px;margin-top:6px}
-
-  /* Info modal images + meta */
-  .imgrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:16px}
-  .imgcell{border:1px solid var(--stroke);border-radius:11px;overflow:hidden;background:var(--surface2)}
-  .imgcell .cap{font-family:"JetBrains Mono",monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);padding:6px 9px;border-bottom:1px solid var(--stroke);display:flex;justify-content:space-between;align-items:center}
-  .imgcell .pic{aspect-ratio:1/1;display:grid;place-items:center;
-    background-image:linear-gradient(45deg,#16181d 25%,transparent 25%),linear-gradient(-45deg,#16181d 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#16181d 75%),linear-gradient(-45deg,transparent 75%,#16181d 75%);background-size:14px 14px;background-position:0 0,0 7px,7px -7px,-7px 0}
-  .imgcell .pic img{max-width:90%;max-height:90%} .imgcell .pic.none{color:var(--faint);font-family:"JetBrains Mono",monospace;font-size:11px}
-  .meta-table{width:100%;border-collapse:collapse;font-size:12.5px}
-  .meta-table td{padding:5px 8px;border-bottom:1px solid var(--stroke);vertical-align:top}
-  .meta-table td:first-child{color:var(--muted);width:44%;font-family:"JetBrains Mono",monospace;font-size:11.5px}
-  .meta-table .panelhdr td{color:var(--gold);font-family:"JetBrains Mono",monospace;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--stroke2);padding-top:13px}
-  .pval{color:var(--ink);text-align:right;font-family:"JetBrains Mono",monospace}
-  .praw{color:var(--faint);font-size:10px}
-
-  .footer{margin-top:26px;text-align:center;color:var(--faint);font-size:11.5px;font-family:"JetBrains Mono",monospace}
-  .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--elevated);border:1px solid var(--gold-dim);color:var(--ink);padding:10px 18px;border-radius:10px;font-size:13px;z-index:60;opacity:0;transition:.2s;pointer-events:none;max-width:90vw;text-align:center}
-  .toast.show{opacity:1}
-  .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--stroke2);border-top-color:var(--gold);border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
-  @keyframes s{to{transform:rotate(360deg)}}
-  @media(max-width:560px){.panel-actions{justify-content:flex-start}}
+  footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--ink-dim); font-size: 12px; }
+  footer b { color: var(--ink); font-weight: 500; }
+  a { color: var(--accent-2); }
 </style>
 </head>
 <body>
-<div class="page">
-  <header class="topbar">
-    <div class="brand">
-      <div class="brand-mark">B</div>
-      <div class="brand-text"><span class="brand-title">Brush</span><span class="brand-sub">Studio</span></div>
-    </div>
-    <div class="topbar-actions">
-      <div class="fontseg">
-        <span class="lbl">SIZE</span>
-        <div class="seg" id="fontseg">
-          <div class="opt" data-fs="13.5">S</div><div class="opt on" data-fs="15">M</div><div class="opt" data-fs="16.5">L</div><div class="opt" data-fs="18.5">XL</div>
-        </div>
-      </div>
-      <button class="btn gold" data-open="import-modal">Import</button>
-    </div>
+<div class="wrap">
+  <header>
+    <p class="kicker">Procreate · Adobe · client-side</p>
+    <h1>Creative File Previewer</h1>
+    <p class="sub">Drop a file to render its embedded preview locally — nothing is uploaded. Procreate formats are ZIP archives carrying a <code>QuickLook/Thumbnail.png</code>; this reads it the same way Prospect does in Finder.</p>
   </header>
 
-  <main>
-    <section class="panel">
-      <div class="panel-header">
-        <div class="panel-heading">
-          <h2>Brushes</h2>
-          <p class="hint">Tap a thumbnail to select. Use the info button for parameters, shape &amp; grain.</p>
-          <p class="counts"><b id="loadedCount">0</b> loaded · <b id="selCount">0</b> selected</p>
-        </div>
-        <div class="panel-actions">
-          <button class="btn ghost sm" id="selAll">Select all</button>
-          <button class="btn ghost sm" id="selPro">Only Procreate</button>
-          <button class="btn ghost sm" id="selNone">Clear</button>
-          <button class="btn ghost sm" id="clearAll">Remove all</button>
-          <button class="btn primary" id="open-export" data-open="export-modal" disabled>Export</button>
-        </div>
-      </div>
-      <div id="brush-grid"></div>
-      <div class="empty" id="empty">No brushes yet — <span class="hl" id="emptyImport">import .brush / .brushset / .abr</span> to begin.</div>
-    </section>
-  </main>
-
-  <p class="footer">Runs entirely in your browser · nothing is uploaded</p>
-</div>
-
-<!-- Import modal -->
-<div class="modal" id="import-modal">
-  <div class="modal-backdrop" data-close></div>
-  <div class="modal-card">
-    <div class="modal-head"><h3>Import brushes</h3><button class="btn ghost sm" data-close>Close</button></div>
-    <div class="modal-body">
-      <div class="dropzone" id="dropzone" tabindex="0" role="button">
-        <input type="file" id="file-input" multiple accept=".brush,.brushset,.abr" />
-        <p>Drop brush files here</p>
-        <span>.brush · .brushset · .abr <small style="opacity:.7">(abr beta)</small> · multiple OK</span>
-      </div>
-      <p class="note">Files are read locally. <span class="mono">.brushset</span>s are split into their individual brushes automatically.</p>
+  <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose or drop a file">
+    <div class="big">Drop a file here</div>
+    <div class="small">or click to choose · everything stays in your browser</div>
+    <div class="formats">
+      <span class="chip on">.procreate</span>
+      <span class="chip on">.brush</span>
+      <span class="chip on">.brushset</span>
+      <span class="chip on">.swatches</span>
+      <span class="chip on">.psd</span>
+      <span class="chip on">.ai</span>
     </div>
   </div>
+  <input type="file" id="file" multiple
+         accept=".procreate,.brush,.brushset,.swatches,.psd,.ai" />
+
+  <div id="out"></div>
+
+  <footer>
+    <b>How it works.</b> Procreate files unzip with JSZip and expose a ready PNG — no decoding required.
+    PSD uses <b>ag-psd</b> (reads the embedded composite). Modern <b>.ai</b> files are PDF-compatible, so the first page renders via pdf.js. The parser functions are DOM-free so they drop straight into a Chrome extension or a Drive "Open with" app.
+  </footer>
 </div>
-
-<!-- Info modal -->
-<div class="modal" id="info-modal">
-  <div class="modal-backdrop" data-close></div>
-  <div class="modal-card">
-    <div class="modal-head"><h3 id="info-title">Brush</h3><button class="btn ghost sm" data-close>Close</button></div>
-    <div class="modal-body" id="info-body"></div>
-  </div>
-</div>
-
-<!-- Export modal -->
-<div class="modal" id="export-modal">
-  <div class="modal-backdrop" data-close></div>
-  <div class="modal-card wide">
-    <div class="modal-head"><div style="flex:1"><h3>Export &amp; package</h3><p class="hint" id="export-sub">0 selected</p></div><button class="btn ghost sm" data-close>Close</button></div>
-    <div class="modal-body">
-
-      <div class="xsec">
-        <div class="xsec-head"><h4>Previews → image</h4><p class="hint">Render the selected brush previews.</p></div>
-        <div class="tilegrid f" id="fmtTiles" role="radiogroup" aria-label="Format">
-          <label class="tile"><input type="radio" name="xfmt" value="png" checked><span class="tc"><span class="ti">PNG</span><span class="tt">PNG</span></span></label>
-          <label class="tile"><input type="radio" name="xfmt" value="jpeg"><span class="tc"><span class="ti">JPG</span><span class="tt">JPEG</span></span></label>
-          <label class="tile"><input type="radio" name="xfmt" value="webp"><span class="tc"><span class="ti">WEB</span><span class="tt">WEBP</span></span></label>
-          <label class="tile"><input type="radio" name="xfmt" value="tiff"><span class="tc"><span class="ti">TIF</span><span class="tt">TIFF</span></span></label>
-          <label class="tile"><input type="radio" name="xfmt" value="pdf"><span class="tc"><span class="ti">PDF</span><span class="tt">PDF</span></span></label>
-        </div>
-        <div class="tilegrid f" id="layoutTiles" role="radiogroup" aria-label="Layout" style="margin-top:10px">
-          <label class="tile"><input type="radio" name="xlayout" value="separate" checked><span class="tc"><span class="ti">▦</span><span class="tt">Separate</span></span></label>
-          <label class="tile"><input type="radio" name="xlayout" value="vertical"><span class="tc"><span class="ti">▤</span><span class="tt">Stacked</span></span></label>
-          <label class="tile"><input type="radio" name="xlayout" value="horizontal"><span class="tc"><span class="ti">▥</span><span class="tt">Strip</span></span></label>
-          <label class="tile"><input type="radio" name="xlayout" value="grid"><span class="tc"><span class="ti">⊞</span><span class="tt">Grid</span></span></label>
-        </div>
-        <div class="optrow">
-          <label class="check"><input type="checkbox" id="optCaption" checked> Name caption (top-left)</label>
-          <label class="check"><input type="checkbox" id="optBg"> White background</label>
-          <span class="ifield">tile <input type="text" id="optTile" class="num" value="512"></span>
-          <span class="ifield">gap <input type="text" id="optGap" class="num" value="16"></span>
-        </div>
-        <div class="xfoot"><button class="btn primary" id="doExportImg">Export previews</button></div>
-      </div>
-
-      <div class="xsec">
-        <div class="xsec-head"><h4>Source files</h4><p class="hint">Work with the real assets, not just previews.</p></div>
-        <div class="tilegrid a">
-          <button class="actiontile" id="doExportShapeGrain"><span class="ti">PNG</span><span class="tt">Shape + grain</span><span class="ts">export PNGs</span></button>
-          <button class="actiontile" id="doSplitBrush"><span class="ti">.br</span><span class="tt">Split → .brush</span><span class="ts">individual files</span></button>
-          <button class="actiontile" id="doAbrTip"><span class="ti">PS</span><span class="tt">.abr tips → PNG</span><span class="ts">Define Brush Preset</span></button>
-          <button class="actiontile" id="doAbrToBrush"><span class="ti">→br</span><span class="tt">.abr → .brush</span><span class="ts">experimental</span></button>
-        </div>
-      </div>
-
-      <div class="xsec" style="margin-bottom:0">
-        <div class="xsec-head"><h4>Package → .brushset</h4><p class="hint">Bundle selected Procreate brushes into one set.</p></div>
-        <div class="optrow">
-          <span class="ifield">name <input type="text" id="setName" value="My Brushes" style="width:200px"></span>
-          <button class="btn gold" id="doPackBrushset">Package .brushset</button>
-        </div>
-        <p class="note warn">Writing real <span class="mono">.abr</span> files isn't reliable in-browser — use “.abr tips → PNG” for Photoshop. Packaging/splitting apply to Procreate brushes.</p>
-      </div>
-
-    </div>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
 
 <script>
-const PARAM_SCHEMA = [{"pn":"Stroke Path","s":"Spacing","p":"$top.root.plotSpacing","t":"float","g":"0-100%","f":"round(72.943 * (raw ^ 0.4558))"},{"pn":"Stroke Path","s":"Spacing Jitter","p":"$top.root.plotSpacingJitter","t":"float","g":"0-100%","f":"round(raw*10)"},{"pn":"Stroke Path","s":"Jitter Lateral","p":"$top.root.plotJitter","t":"float","g":"0-200%","f":"round(60.6919 * (raw ^ 0.4545))"},{"pn":"Stroke Path","s":"Jitter Linear","p":"$top.root.plotJitterLongitudinal","t":"float","g":"0-200%","f":"round(60.6919 * (raw ^ 0.4545))"},{"pn":"Stroke Path","s":"Fall Off","p":"$top.root.dynamicsFalloff","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Stabilization","s":"StreamLine Amount","p":"$top.root.plotSmoothing","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Stabilization","s":"StreamLine Pressure","p":"$top.root.dynamicsPressureSmoothing","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Stabilization","s":"Stabilization Amount","p":"$top.root.plotMovingAverageStabilization","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Stabilization","s":"Motion Filtering Amount","p":"$top.root.plotFFTSmoothingAmount","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Stabilization","s":"Motion Filtering Expression","p":"$top.root.plotFFTSmoothingBias","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Taper","s":"Start Length","p":"$top.root.pencilTaperStartLength","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Taper","s":"End Length","p":"$top.root.pencilTaperEndLength","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Taper","s":"Pressure Taper Link tip sizes","p":"$top.root.pencilTaperSizeLinked","t":"bool","g":"on/off","f":"True/False"},{"pn":"Taper","s":"Pressure Taper Size","p":"$top.root.pencilTaperSize","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Taper","s":"Pressure Taper Opacity","p":"$top.root.pencilTaperOpacity","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Taper","s":"Pressure Taper Pressure","p":"$top.root.taperPressure","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Taper","s":"Pressure Taper Tip","p":"$top.root.pencilTaperShape","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Taper","s":"Pressure Taper Tip Animation","p":"$top.root.pencilTipAnimation","t":"bool","g":"on/off","f":"True/False"},{"pn":"Taper","s":"Touch Start Length","p":"$top.root.taperStartLength","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Taper","s":"Touch End Length","p":"$top.root.taperEndLength","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Taper","s":"Touch Taper Link tip sizes","p":"$top.root.taperSizeLinked","t":"bool","g":"on/off","f":"True/False"},{"pn":"Taper","s":"Touch Taper Size","p":"$top.root.taperSize","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Taper","s":"Touch Taper Opacity","p":"$top.root.taperOpacity","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Taper","s":"Touch Taper Tip","p":"$top.root.taperShape","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Taper","s":"Classic Taper","p":"$top.root.taperVersion","t":"int","g":"on/off","f":"0 = classic taper on, 1 = classic taper off"},{"pn":"Shape","s":"Shape Source","p":"$top.root.bundledShapePath","t":"str","g":null,"f":null},{"pn":"Shape","s":"Input Style","p":"$top.root.shapeAzimuth","t":"bool","g":["Touch Only","Azimuth","Azimuth and Rolling"],"f":null},{"pn":"Shape","s":"Relative to Stroke","p":"$top.root.shapeRollMode","t":"bool","g":"on/off","f":"raw == 1"},{"pn":"Shape","s":"Rotation","p":"$top.root.shapeRotation","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Shape","s":"Scatter","p":"$top.root.shapeScatter","t":"float","g":"0-200%","f":"round(raw*100)"},{"pn":"Shape","s":"Count","p":"$top.root.shapeCount","t":"float","g":"1-16","f":"round(raw * 16)"},{"pn":"Shape","s":"Count Jitter","p":"$top.root.shapeCountJitter","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Shape","s":"Randomized","p":"$top.root.shapeRandomise","t":"bool","g":"on/off","f":"True/False"},{"pn":"Shape","s":"Flip X","p":"$top.root.shapeFlipXJitter","t":"bool","g":"on/off","f":"True/False"},{"pn":"Shape","s":"Flip Y","p":"$top.root.shapeFlipYJitter","t":"bool","g":"on/off","f":"True/False"},{"pn":"Shape","s":"Roundness","p":"$top.root.shapeRoundness","t":"float","g":"circle or ellipse","f":"if Raw = 1 then no distortion (circle), else if 0 < Raw < 1 then increasing horizontal/vertical compression (ellipse)"},{"pn":"Shape","s":"Angle","p":"$top.root.shapeAngle","t":"float","g":"0-360","f":"round(raw * 180 / PI())"},{"pn":"Shape","s":"Pressure Roundness","p":"$top.root.dynamicsPressureShapeRoundness","t":"float","g":"-100-100%","f":"(raw[0] === 1 && raw[1] === 1) ? 0 : (raw[0] === 1 && raw[1] < 1) ? round((1 - raw[1]) * 100) : (raw[1] === 1 && raw[0] < 1) ? -round((1 - raw[0]) * 100) : 0"},{"pn":"Shape","s":"Tilt Roundness","p":"$top.root.dynamicsTiltShapeRoundness","t":"float","g":"-100-100%","f":"(raw[0] === 1 && raw[1] === 1) ? 0 : (raw[0] === 1 && raw[1] < 1) ? round((1 - raw[1]) * 100) : (raw[1] === 1 && raw[0] < 1) ? -round((1 - raw[0]) * 100) : 0"},{"pn":"Shape","s":"Roundness Vertical Jitter","p":"$top.root.jitterShapeRoundness","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Shape","s":"Roundness Horizontal Jitter","p":"$top.root.jitterShapeRoundnessX","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Shape","s":"Shape Filtering","p":"$top.root.shapeFilter","t":"composite","g":["No filtering","Classic filtering","Improved filtering"],"f":null},{"pn":"Grain","s":"Grain Source","p":"$top.root.bundledGrainPath","t":"str","g":null,"f":null},{"pn":"Grain","s":"Moving/Texturised","p":"$top.root.textureApplication","t":"int","g":"Moving/Texturised","f":"0 = Moving, 1 = Texturised"},{"pn":"Grain","s":"Movement","p":"$top.root.textureMovement","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Grain","s":"Scale","p":"$top.root.textureScale","t":"float","g":"0-100%","f":"round(25 * SQRT(raw))"},{"pn":"Grain","s":"Zoom","p":"$top.root.textureZoom","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Grain","s":"Rotation","p":"$top.root.textureRotation","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Grain","s":"Depth","p":"$top.root.grainDepth","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Grain","s":"Depth Minimum","p":"$top.root.grainDepthMinimum","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Grain","s":"Depth Jitter","p":"$top.root.grainDepthJitter","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Grain","s":"Offset Jitter","p":"$top.root.textureOffsetJitter","t":"bool","g":"on/off","f":"True/False"},{"pn":"Grain","s":"Blend Mode","p":"$top.root.grainBlendMode","t":"int","g":["Multiply","Darken","Colour Burn","Linear Burn","Lighten","Colour Dodge","Overlay","Hard Mix","Difference","Subtract","Divide","Height","Linear Height"],"f":null},{"pn":"Grain","s":"Brightness","p":"$top.root.textureBrightness","t":"float","g":"-75-75%","f":"round(raw*100)"},{"pn":"Grain","s":"Contrast","p":"$top.root.textureContrast","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Grain","s":"Grain Filtering","p":"$top.root.textureFilter","t":"composite","g":["No filtering","Classic filtering","Improved filtering"],"f":null},{"pn":"Grain","s":"3D Grain Follow Camera","p":"$top.root.texturizedGrainFollowsCamera","t":"bool","g":"on/off","f":"True/False"},{"pn":"Rendering","s":"Rendering Mode","p":"$top.root.renderingRecursiveMixing","t":"bool","g":["Light Glaze","Uniformed Glaze","Intense Glaze","Heavy Glaze","Uniform Blending","Intense Blending"],"f":null},{"pn":"Rendering","s":"Flow","p":"$top.root.dynamicsGlazedFlow","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Rendering","s":"Wet Edges","p":"$top.root.wetEdgesAmount","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Rendering","s":"Burnt Edges","p":"$top.root.burntEdgesAmount","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Rendering","s":"Burnt Edges Mode","p":"$top.root.burntEdgesBlendMode","t":"int","g":null,"f":null},{"pn":"Rendering","s":"Blend Mode","p":"$top.root.blendMode","t":"int","g":null,"f":null},{"pn":"Rendering","s":"Luminance Blending","p":"$top.root.blendGammaCorrect","t":"bool","g":"on/off","f":"True/False"},{"pn":"Rendering","s":"Alpha Threshold","p":"$top.root.alphaThreshold","t":"bool","g":"on/off","f":"True/False"},{"pn":"Rendering","s":"Alpha Threshold Amount","p":"$top.root.alphaThresholdAmount","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Wet Mix","s":"Dilution","p":"$top.root.dynamicsMix","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Wet Mix","s":"Charge","p":"$top.root.dynamicsLoad","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Wet Mix","s":"Attack","p":"$top.root.dynamicsPressureMix","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Wet Mix","s":"Pull","p":"$top.root.dynamicsWetAccumulation","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Wet Mix","s":"Grade","p":"$top.root.dynamicsMixSoftening","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Wet Mix","s":"Blur","p":"$top.root.dynamicsBlur","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Wet Mix","s":"Blur Jitter","p":"$top.root.dynamicsBlurJitter","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Wet Mix","s":"Wetness Jitter","p":"$top.root.dynamicsWetnessJitter","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Stamp Color Jitter - Hue","p":"$top.root.dynamicsJitterHue","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Stamp Color Jitter - Saturate","p":"$top.root.dynamicsJitterSaturation","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Stamp Color Jitter - Lightness","p":"$top.root.dynamicsJitterLightness","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Stamp Color Jitter - Darkness","p":"$top.root.dynamicsJitterDarkness","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Stamp Color Jitter - Secondary Colour","p":"$top.root.jitterSecondary","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Stroke Color Jitter - Hue","p":"$top.root.dynamicsJitterStrokeHue","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Stroke Color Jitter - Saturate","p":"$top.root.dynamicsJitterStrokeSaturation","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Stroke Color Jitter - Lightness","p":"$top.root.dynamicsJitterStrokeLightness","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Stroke Color Jitter - Darkness","p":"$top.root.dynamicsJitterStrokeDarkness","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Stroke Color Jitter - Secondary Colour","p":"$top.root.jitterStrokeSecondary","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Colour Pressure - Hue","p":"$top.root.dynamicsPressureHue","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Colour Pressure - Saturate","p":"$top.root.dynamicsPressureSaturation","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Colour Pressure - Brightness","p":"$top.root.dynamicsPressureBrightness","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Colour Pressure - Secondary Colour","p":"$top.root.dynamicsPressureSecondaryColor","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Colour Tilt - Hue","p":"$top.root.dynamicsTiltHue","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Colour Tilt - Saturate","p":"$top.root.dynamicsTiltSaturation","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Colour Tilt - Brightness","p":"$top.root.dynamicsTiltBrightness","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Colour Tilt - Secondary Colour","p":"$top.root.dynamicsTiltSecondaryColor","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Colour Barrel Roll - Hue","p":"$top.root.dynamicsRollHue","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Colour Barrel Roll - Saturate","p":"$top.root.dynamicsRollSaturation","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Colour Barrel Roll - Brightness","p":"$top.root.dynamicsRollBrightness","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Color Dynamics","s":"Colour Barrel Roll - Secondary Colour","p":"$top.root.dynamicsRollSecondaryColor","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Dynamics","s":"Speed Size","p":"$top.root.dynamicsSpeedSize","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Dynamics","s":"Speed Opacity","p":"$top.root.dynamicsSpeedOpacity","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Dynamics","s":"Speed Spacing","p":"$top.root.plotSpacingSpeed","t":"float","g":"0-100%","f":"round(raw*10)"},{"pn":"Dynamics","s":"Jitter Size","p":"$top.root.dynamicsJitterSize","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Dynamics","s":"Jitter Opacity","p":"$top.root.dynamicsJitterOpacity","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Apple Pencil","s":"Pressure Curve","p":"$top.root.dynamicsPressureOverall.points.NS\\.objects[0]","t":"curve","g":null,"f":null},{"pn":"Apple Pencil","s":"Pressure - Size","p":"$top.root.dynamicsPressureSize","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Apple Pencil","s":"Pressure - Opacity","p":"$top.root.dynamicsPressureOpacityTransfer","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Apple Pencil","s":"Pressure - Flow","p":"$top.root.dynamicsPressureOpacity","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Apple Pencil","s":"Pressure - Bleed","p":"$top.root.dynamicsPressureBleed","t":"float","g":"0-100%","f":"round(100 * raw ^ (1/2.21))"},{"pn":"Apple Pencil","s":"Tilt Angle","p":"$top.root.dynamicsTiltAngle","t":"float","g":"0-90","f":"round(raw * 90)"},{"pn":"Apple Pencil","s":"Tilt - Opacity","p":"$top.root.dynamicsTiltOpacity","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Apple Pencil","s":"Tilt - Gradation","p":"$top.root.dynamicsTiltGradation","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Apple Pencil","s":"Tilt - Bleed","p":"$top.root.dynamicsTiltBleed","t":"float","g":"0-100%","f":"round(100 * raw ^ (1/2.21))"},{"pn":"Apple Pencil","s":"Tilt - Size","p":"$top.root.dynamicsTiltSize","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Apple Pencil","s":"Tilt - Size Compression","p":"$top.root.dynamicsTiltCompression","t":"float","g":"on/off","f":"True/False"},{"pn":"Apple Pencil","s":"Barrel Roll - Size","p":"$top.root.dynamicsRollSize","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Apple Pencil","s":"Barrel Roll - Opacity","p":"$top.root.dynamicsRollOpacity","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Apple Pencil","s":"Barrel Roll - Bleed","p":"$top.root.dynamicsRollBleed","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Apple Pencil","s":"Cursor Outline ","p":"$top.root.hoverOutline","t":"int","g":"None, Contrast, Active colour","f":"0 = None, 1 = Contrast, 2 = Active colour"},{"pn":"Apple Pencil","s":"Hover - Estimated Pressure","p":"$top.root.hoverPressure","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Apple Pencil","s":"Hover Fill","p":"$top.root.hoverFill","t":"int","g":"none, all, shape","f":"0 = None, 1 = All, 2 = Shape"},{"pn":"Properties","s":"Orient to Screen","p":"$top.root.oriented","t":"bool","g":"on/off","f":"True/False"},{"pn":"Properties","s":"Smudge Pull","p":"$top.root.dynamicsSmudgeAccumulation","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Properties","s":"Maximum Size","p":"$top.root.maxSize","t":"float","g":"0-1600%","f":"round(raw * 100)"},{"pn":"Properties","s":"Minimum Size","p":"$top.root.minSize","t":"float","g":"0-1600%","f":"round(raw * 100)"},{"pn":"Properties","s":"Maximum Opacity","p":"$top.root.maxOpacity","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Properties","s":"Minimum Opacity","p":"$top.root.minOpacity","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Materials","s":"Metallic Amount","p":"$top.root.metallicAmount","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Materials","s":"Metallic Scale","p":"$top.root.metallicScale","t":"float","g":"0-100%","f":"round(25 * SQRT(raw))"},{"pn":"Materials","s":"Roughness Amount","p":"$top.root.roughnessAmount","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Materials","s":"Roughness Scale","p":"$top.root.roughnessScale","t":"float","g":"0-100%","f":"round(25 * SQRT(raw))"},{"pn":"Preview","s":"Use Stamp Preview","p":"$top.root.stamp","t":"bool","g":"on/off","f":"True/False"},{"pn":"Preview","s":"Size","p":"$top.root.previewSize","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Preview","s":"Pressure Minimum","p":"$top.root.previewPressureMinimum","t":"float","g":"0-100%","f":"round(raw*100)"},{"pn":"Preview","s":"Pressure Scale","p":"$top.root.previewPressureScale","t":"float","g":"0-200%","f":"round(raw*100)"},{"pn":"Preview","s":"Wet Mix","p":"$top.root.previewWetMixEnabled","t":"bool","g":"on/off","f":"True/False"},{"pn":"Preview","s":"Tilt Angle","p":"$top.root.previewTiltAngleOffset","t":"float","g":"-100-100%","f":"round(raw*100)"},{"pn":"Dual Brush","s":"Combine Mode","p":"$top.root.dualBlendMode","t":"int","g":null,"f":null}];
+/* ════════════════════════ PARSE LAYER (portable, DOM-free) ════════════════════════ */
 
-/* ============================================================================
-   Brush Studio — single-file client-side brush previewer / packager
-   Modules:  bplist reader → NSKeyedArchiver resolve → param decode
-             Procreate (.brush/.brushset) reader · ABR reader (beta)
-             image export (PNG/JPEG/WEBP/TIFF/PDF) · brushset packager
-   ========================================================================== */
-
-const $  = s => document.querySelector(s);
-const $$ = s => [...document.querySelectorAll(s)];
-const toast = (() => { const t=$('#toast'); let h; return (m)=>{t.textContent=m;t.classList.add('show');clearTimeout(h);h=setTimeout(()=>t.classList.remove('show'),2600);}; })();
-const uid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return (c==='x'?r:(r&0x3|0x8)).toString(16);}).toUpperCase();
-
-/* ---------- binary plist (bplist00) reader ---------- */
-function parseBplist(buf){
-  const dv = new DataView(buf), bytes = new Uint8Array(buf);
-  if (String.fromCharCode(...bytes.slice(0,6)) !== 'bplist') throw new Error('not a binary plist');
-  const len = buf.byteLength;
-  const offsetSize = dv.getUint8(len-26);
-  const refSize    = dv.getUint8(len-25);
-  const numObjects = Number(dv.getBigUint64(len-24));
-  const topObject  = Number(dv.getBigUint64(len-16));
-  const tableOff   = Number(dv.getBigUint64(len-8));
-  const readSized = (p,sz)=>{let v=0;for(let i=0;i<sz;i++)v=v*256+dv.getUint8(p+i);return v;};
-  const offsets=[]; for(let i=0;i<numObjects;i++) offsets.push(readSized(tableOff+i*offsetSize, offsetSize));
-  const seen = new Array(numObjects);
-  function readObj(idx){
-    if(seen[idx]!==undefined) return seen[idx];
-    let p = offsets[idx];
-    const marker = dv.getUint8(p++); const hi = marker>>4, lo = marker&0x0f;
-    let val;
-    if(marker===0x00) val=null;
-    else if(marker===0x08) val=false;
-    else if(marker===0x09) val=true;
-    else if(hi===0x1){ const n=1<<lo; let v=0; for(let i=0;i<n;i++)v=v*256+dv.getUint8(p+i); val=v; }
-    else if(hi===0x2){ const n=1<<lo; val = (n===4)?dv.getFloat32(p):dv.getFloat64(p); }
-    else if(hi===0x3){ val = new Date(978307200000 + dv.getFloat64(p)*1000); } // Apple epoch
-    else if(hi===0x4){ let cnt=lo; if(lo===0x0f){const r=readLen(p);cnt=r.cnt;p=r.p;} val = new Uint8Array(buf, p, cnt).slice(); }
-    else if(hi===0x5){ let cnt=lo; if(lo===0x0f){const r=readLen(p);cnt=r.cnt;p=r.p;} val = ascii(p,cnt); }
-    else if(hi===0x6){ let cnt=lo; if(lo===0x0f){const r=readLen(p);cnt=r.cnt;p=r.p;} let s=''; for(let i=0;i<cnt;i++)s+=String.fromCharCode(dv.getUint16(p+i*2)); val=s; }
-    else if(hi===0x8){ const n=lo+1; let v=0; for(let i=0;i<n;i++)v=v*256+dv.getUint8(p+i); val={__uid:v}; }
-    else if(hi===0xA){ let cnt=lo; if(lo===0x0f){const r=readLen(p);cnt=r.cnt;p=r.p;} val=[]; seen[idx]=val; for(let i=0;i<cnt;i++)val.push(readObj(readSized(p+i*refSize,refSize))); }
-    else if(hi===0xD){ let cnt=lo; if(lo===0x0f){const r=readLen(p);cnt=r.cnt;p=r.p;} val={}; seen[idx]=val; const keys=[]; for(let i=0;i<cnt;i++)keys.push(readObj(readSized(p+i*refSize,refSize))); for(let i=0;i<cnt;i++)val[keys[i]]=readObj(readSized(p+(cnt+i)*refSize,refSize)); }
-    else val=null;
-    seen[idx]=val; return val;
-  }
-  function readLen(p){ const m=dv.getUint8(p++); const n=1<<(m&0x0f); let cnt=0; for(let i=0;i<n;i++)cnt=cnt*256+dv.getUint8(p+i); return {cnt,p:p+n}; }
-  function ascii(p,n){ let s=''; for(let i=0;i<n;i++)s+=String.fromCharCode(dv.getUint8(p+i)); return s; }
-  const root = readObj(topObject);
-  return {root, objects:seen};
+/** Find the first ZIP entry whose path matches a regex (case-insensitive paths vary). */
+function findEntry(zip, re) {
+  const hits = [];
+  zip.forEach((path, entry) => { if (!entry.dir && re.test(path)) hits.push(entry); });
+  return hits;
 }
 
-/* ---------- NSKeyedArchiver path resolver ---------- */
-function deref(v, archive){ return (v && typeof v==='object' && '__uid' in v) ? archive.objects[v.__uid] : v; }
-function resolvePath(archive, path){
-  // path like "$top.root.plotSpacing" ; handle [i] and escaped \.
-  let clean = path.replace(/^\$top\.?/,'');
-  const segs=[]; let cur='';
-  for(let i=0;i<clean.length;i++){const c=clean[i];
-    if(c==='\\'){cur+=clean[++i]||'';continue;}
-    if(c==='.'){if(cur){segs.push(cur);cur='';}continue;}
-    cur+=c;
-  } if(cur)segs.push(cur);
-  let node = deref(archive.root['$top'], archive); // top dict
-  for(let seg of segs){
-    if(node==null) return undefined;
-    const m = seg.match(/^(.+?)\[(\d+)\]$/);
-    if(m){ node = deref(node[m[1]], archive); node = node ? deref(node[+m[2]], archive) : undefined; }
-    else { node = deref(node[seg], archive); }
-  }
-  return node;
+/** .procreate / .brush → single embedded PNG thumbnail. Returns {blobUrl, w, h}. */
+async function parseProcreateThumb(buf) {
+  const zip = await JSZip.loadAsync(buf);
+  const hits = findEntry(zip, /(^|\/)QuickLook\/Thumbnail\.png$/i);
+  if (!hits.length) throw new Error('No QuickLook/Thumbnail.png inside the archive.');
+  const blob = await hits[0].async('blob');
+  return { blobUrl: URL.createObjectURL(blob) };
 }
 
-/* ---------- tiny safe formula evaluator (round, sqrt, ^, + - * /) ---------- */
-function evalFormula(formula, raw){
-  try{
-    const toks = formula.match(/(\d+\.?\d*|[a-zA-Z_]+|[()^*/+\-,])/g); if(!toks) return null;
-    const out=[], ops=[]; const prec={'+':1,'-':1,'*':2,'/':2,'^':3}; const right={'^':1};
-    const funcs={round:Math.round,sqrt:Math.sqrt,SQRT:Math.sqrt,abs:Math.abs,pow:Math.pow,min:Math.min,max:Math.max};
-    const consts={raw:raw,PI:Math.PI};
-    const apply=(o)=>{const b=out.pop(),a=out.pop();out.push(o==='+'?a+b:o==='-'?a-b:o==='*'?a*b:o==='/'?a/b:Math.pow(a,b));};
-    for(let i=0;i<toks.length;i++){const t=toks[i];
-      if(/^\d/.test(t)) out.push(parseFloat(t));
-      else if(t in consts) out.push(consts[t]);
-      else if(t in funcs) ops.push(t);
-      else if(t===',') { while(ops.length&&ops[ops.length-1]!=='(')apply(ops.pop()); }
-      else if(t==='(') ops.push(t);
-      else if(t===')'){ while(ops.length&&ops[ops.length-1]!=='(')apply(ops.pop()); ops.pop(); if(ops.length&&ops[ops.length-1] in funcs){const f=ops.pop();out.push(funcs[f](out.pop()));} }
-      else { while(ops.length){const top=ops[ops.length-1]; if(top in prec && (prec[top]>prec[t]||(prec[top]===prec[t]&&!right[t]))) apply(ops.pop()); else break;} ops.push(t); }
-    }
-    while(ops.length) apply(ops.pop());
-    const r = out.pop();
-    return (typeof r==='number'&&isFinite(r))?r:null;
-  }catch(e){ return null; }
-}
-
-/* ---------- decode Procreate brush params using PARAM_SCHEMA ---------- */
-const BOOL_FALSE = new Set([0,'0',false,null,undefined]);
-function decodeParams(archive){
-  const byPanel = {};
-  for(const e of PARAM_SCHEMA){
-    let raw;
-    try{ raw = resolvePath(archive, e.p); }catch(_){ raw = undefined; }
-    if(raw===undefined) continue;
-    let val;
-    if(e.t==='bool') val = !BOOL_FALSE.has(raw) ? 'On' : 'Off';
-    else if(e.t==='float' && e.f && typeof raw==='number'){ const v=evalFormula(e.f, raw); val = v==null? raw : v; }
-    else if(typeof raw==='number') val = Math.round(raw*1000)/1000;
-    else if(typeof raw==='string') val = raw;
-    else val = raw;
-    (byPanel[e.pn] = byPanel[e.pn] || []).push({setting:e.s, value:val, raw:(typeof raw==='number'?Math.round(raw*10000)/10000:raw), gui:e.g});
-  }
-  return byPanel;
-}
-function brushName(archive){
-  for(const k of ['name','brushName']){
-    const v = resolvePath(archive, '$top.root.'+k);
-    if(typeof v==='string' && v.trim()) return v.trim();
-  }
-  return null;
-}
-function brushDates(archive){
-  const d={};
-  // Procreate brushes rarely store dates internally; surface any Date objects found at root.
-  const root = deref(archive.root['$top'], archive);
-  const r = root && deref(root.root, archive);
-  if(r){ for(const k in r){ const v=deref(r[k],archive); if(v instanceof Date){ d[k]=v; } } }
-  return d;
-}
-
-/* ---------- ZIP helpers (Procreate) ---------- */
-async function loadZip(buf){ return await JSZip.loadAsync(buf); }
-function blobUrl(blob){ return URL.createObjectURL(blob); }
-
-async function readProcreateBrush(zip, prefix){
-  const at = name => zip.file(prefix+name);
-  const item = { id:uid(), name:null, params:null, dates:{}, files:{}, type:'pro' };
-  // collect every file in this brush folder for faithful repackaging
-  zip.forEach((path,e)=>{ if(!e.dir && path.startsWith(prefix)) item.files[path.slice(prefix.length)] = e; });
-  const thumb = at('QuickLook/Thumbnail.png');
-  if(thumb) item.thumbUrl = blobUrl(await thumb.async('blob'));
-  const shape = at('Shape.png'); if(shape){ item.shapeBlob = await shape.async('blob'); item.shapeUrl = blobUrl(item.shapeBlob); }
-  const grain = at('Grain.png'); if(grain){ item.grainBlob = await grain.async('blob'); item.grainUrl = blobUrl(item.grainBlob); }
-  const arch = at('Brush.archive');
-  if(arch){
-    try{
-      const ab = await arch.async('arraybuffer');
-      item.archiveBuf = ab;
-      const archive = parseBplist(ab);
-      item.name = brushName(archive);
-      item.params = decodeParams(archive);
-      item.dates = brushDates(archive);
-    }catch(e){ console.warn('archive parse failed', e); }
-  }
-  if(!item.thumbUrl && item.shapeUrl) item.thumbUrl = item.shapeUrl; // fallback preview
-  return item;
-}
-
-async function readBrushFile(file){
-  const buf = await file.arrayBuffer();
-  const zip = await loadZip(buf);
-  const item = await readProcreateBrush(zip, '');
-  item.source = file.name; item.sourceModified = file.lastModified;
-  if(!item.name) item.name = file.name.replace(/\.brush$/i,'');
-  return [item];
-}
-
-async function readBrushset(file){
-  const buf = await file.arrayBuffer();
-  const zip = await loadZip(buf);
-  // each brush folder contains Brush.archive
-  const prefixes = new Set();
-  zip.forEach((path,e)=>{ const m = path.match(/^(.*\/)?Brush\.archive$/); if(m && !e.dir){ prefixes.add(path.slice(0, path.length-'Brush.archive'.length)); } });
-  const items=[];
-  for(const pre of prefixes){
-    try{
-      const it = await readProcreateBrush(zip, pre);
-      it.source = file.name; it.sourceModified = file.lastModified;
-      it.folderName = pre.replace(/\/$/,'').split('/').pop();
-      if(!it.name) it.name = it.folderName || file.name;
-      items.push(it);
-    }catch(e){ console.warn('brush in set failed', e); }
-  }
-  return items;
-}
-
-/* ---------- ABR reader (beta): extract sampled tip bitmaps ---------- */
-function decodePackBits(src, expected){
-  const out = new Uint8Array(expected); let o=0, i=0;
-  while(i<src.length && o<expected){
-    let n = src[i++];
-    if(n<128){ const c=n+1; for(let k=0;k<c&&i<src.length&&o<expected;k++) out[o++]=src[i++]; }
-    else if(n>128){ const c=257-n; const v=src[i++]; for(let k=0;k<c&&o<expected;k++) out[o++]=v; }
+/** .brushset → many embedded thumbnails (one per brush). Returns [{blobUrl, name}]. */
+async function parseBrushset(buf) {
+  const zip = await JSZip.loadAsync(buf);
+  // Each brush folder carries its own QuickLook/Thumbnail.png — glob them all.
+  const hits = findEntry(zip, /(^|\/)QuickLook\/Thumbnail\.png$/i);
+  if (!hits.length) throw new Error('No brush thumbnails found.');
+  const out = [];
+  for (const e of hits) {
+    const blob = await e.async('blob');
+    const folder = e.name.split('/QuickLook/')[0].split('/').pop() || 'brush';
+    out.push({ blobUrl: URL.createObjectURL(blob), name: folder });
   }
   return out;
 }
-function grayBitmapToPNGBlob(gray, w, h){
-  const cv=document.createElement('canvas'); cv.width=w; cv.height=h;
-  const ctx=cv.getContext('2d'); const img=ctx.createImageData(w,h);
-  for(let i=0;i<w*h;i++){ const v=gray[i]; img.data[i*4]=img.data[i*4+1]=img.data[i*4+2]=v; img.data[i*4+3]=255; }
-  ctx.putImageData(img,0,0);
-  return new Promise(res=>cv.toBlob(res,'image/png'));
-}
-async function readAbr(file){
-  const buf = await file.arrayBuffer(); const dv=new DataView(buf); const u8=new Uint8Array(buf);
-  const items=[]; const version=dv.getUint16(0);
-  const str=(p,n)=>{let s='';for(let i=0;i<n;i++)s+=String.fromCharCode(u8[p+i]);return s;};
-  try{
-    if(version>=6){
-      let p=4; // version(2)+subversion(2)
-      while(p+12<=buf.byteLength){
-        if(str(p,4)!=='8BIM'){ p++; continue; }
-        const key=str(p+4,4); const len=dv.getUint32(p+8); const start=p+12, end=start+len;
-        if(key==='samp'){
-          let q=start, idx=0;
-          while(q+4<=end){
-            const recLen=dv.getUint32(q); q+=4; const recEnd=q+recLen + (recLen&1);
-            try{
-              // brush id (pascal string), then optional fields, then intermediate header
-              // scan within record for a plausible 31-byte header: ver,len,unk,top,left,bottom,right,depth(2),comp(1)
-              let hp=q;
-              // skip a leading pascal-ish id if present
-              // search for header by trying offsets until rect is sane
-              let found=null;
-              for(let off=q; off<Math.min(q+64,recEnd-31); off++){
-                const top=dv.getInt32(off+12),left=dv.getInt32(off+16),bot=dv.getInt32(off+20),right=dv.getInt32(off+24);
-                const depth=dv.getUint16(off+28), comp=dv.getUint8(off+30);
-                const w=right-left, h=bot-top;
-                if(w>0&&h>0&&w<8192&&h<8192&&(depth===8||depth===16)&&(comp===0||comp===1)){ found={off,w,h,depth,comp,top,left,bot,right}; break; }
-              }
-              if(found){
-                const {w,h,comp}=found; let dp=found.off+31; const total=w*h; let gray;
-                if(comp===0){ gray=u8.slice(dp, dp+total); }
-                else { // per-row PackBits: first h*2 bytes are row byte-lengths
-                  const rowLens=[]; for(let r=0;r<h;r++){rowLens.push(dv.getUint16(dp)); dp+=2;}
-                  gray=new Uint8Array(total);
-                  for(let r=0;r<h;r++){ const rl=rowLens[r]; const row=decodePackBits(u8.slice(dp,dp+rl), w); gray.set(row.slice(0,w), r*w); dp+=rl; }
-                }
-                const blob = await grayBitmapToPNGBlob(gray,w,h);
-                const it = { id:uid(), type:'abr', name:file.name.replace(/\.abr$/i,'')+' · '+(idx+1), source:file.name, sourceModified:file.lastModified,
-                             shapeBlob:blob, shapeUrl:blobUrl(blob), thumbUrl:blobUrl(blob), abrW:w, abrH:h };
-                items.push(it);
-              }
-            }catch(e){ /* skip this record */ }
-            q=recEnd; idx++;
-            if(idx>500) break;
-          }
-        }
-        p=end;
-      }
-    } else {
-      // v1/v2 rarely used now — flag unsupported but don't crash
-    }
-  }catch(e){ console.warn('abr parse error', e); }
-  if(!items.length){
-    items.push({ id:uid(), type:'abr', name:file.name.replace(/\.abr$/i,''), source:file.name, sourceModified:file.lastModified, undecodable:true });
+
+/** HSV (0..1) → #rrggbb. Procreate stores swatch colors as hue/sat/brightness. */
+function hsvToHex(h, s, v) {
+  const i = Math.floor(h * 6), f = h * 6 - i;
+  const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  let r, g, b;
+  switch (i % 6) {
+    case 0: r = v; g = t; b = p; break;
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    default: r = v; g = p; b = q;
   }
-  return items;
+  const hx = x => Math.round(x * 255).toString(16).padStart(2, '0');
+  return '#' + hx(r) + hx(g) + hx(b);
 }
 
-/* =========================== STATE + RENDER =========================== */
-const state = { items: [] };
-
-async function ingest(files){
-  for(const f of files){
-    const ext = (f.name.split('.').pop()||'').toLowerCase();
-    try{
-      let arr=[];
-      if(ext==='brush') arr=await readBrushFile(f);
-      else if(ext==='brushset') arr=await readBrushset(f);
-      else if(ext==='abr') arr=await readAbr(f);
-      else { toast('Skipped '+f.name+' (unsupported)'); continue; }
-      state.items.push(...arr);
-    }catch(e){ console.error(e); toast('Failed: '+f.name); }
-  }
-  render();
+/** .swatches → palette name + array of hex colors. */
+async function parseSwatches(buf) {
+  const zip = await JSZip.loadAsync(buf);
+  const hits = findEntry(zip, /(^|\/)Swatches\.json$/i);
+  if (!hits.length) throw new Error('No Swatches.json inside the archive.');
+  const data = JSON.parse(await hits[0].async('string'));
+  const pal = Array.isArray(data) ? data[0] : data;        // .swatches can wrap a single palette
+  const colors = (pal.swatches || []).map(sw =>
+    sw ? hsvToHex(sw.hue, sw.saturation, sw.brightness) : null
+  );
+  return { name: pal.name || 'Untitled palette', colors };
 }
 
-
-function esc(s){return (s+'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
-const selected = ()=> state.items.filter(i=>i.selected);
-
-/* ---------- info modal ---------- */
-
-function dl(it,what){ return (it.name||'brush').replace(/[^\w.-]+/g,'_')+'_'+what; }
-
-/* ---------- image rendering for export ---------- */
-function loadImg(url){ return new Promise((res,rej)=>{const i=new Image();i.onload=()=>res(i);i.onerror=rej;i.src=url;}); }
-async function renderTile(it, opts){
-  const S=opts.tile; const cv=document.createElement('canvas'); cv.width=S; cv.height=S; const ctx=cv.getContext('2d');
-  if(opts.bg){ ctx.fillStyle='#fff'; ctx.fillRect(0,0,S,S); }
-  if(it.thumbUrl){ try{ const im=await loadImg(it.thumbUrl); const r=Math.min(S/im.width,S/im.height); const w=im.width*r,h=im.height*r; ctx.drawImage(im,(S-w)/2,(S-h)/2,w,h); }catch(_){} }
-  if(opts.caption){
-    const name=it.name||'Brush'; ctx.font='600 '+Math.max(13,Math.round(S*0.045))+'px "Hanken Grotesk",sans-serif';
-    const pad=Math.round(S*0.03), tw=ctx.measureText(name).width, th=Math.round(S*0.07);
-    ctx.fillStyle='rgba(0,0,0,0.62)'; ctx.fillRect(pad-4, pad-2, tw+12, th);
-    ctx.fillStyle='#fff'; ctx.textBaseline='top'; ctx.fillText(name, pad+2, pad+Math.round(S*0.01));
-  }
-  return cv;
-}
-function tiffEncode(cv){ // baseline uncompressed RGB TIFF (little-endian)
-  const w=cv.width,h=cv.height; const ctx=cv.getContext('2d'); const px=ctx.getImageData(0,0,w,h).data;
-  const rgb=new Uint8Array(w*h*3); for(let i=0;i<w*h;i++){rgb[i*3]=px[i*4];rgb[i*3+1]=px[i*4+1];rgb[i*3+2]=px[i*4+2];}
-  const nTags=10, ifdSize=2+nTags*12+4; const headerSize=8; const stripOff=headerSize+ifdSize;
-  const total=stripOff+rgb.length; const ab=new ArrayBuffer(total); const dv=new DataView(ab); const u8=new Uint8Array(ab);
-  dv.setUint16(0,0x4949,true); dv.setUint16(2,42,true); dv.setUint32(4,8,true);
-  let o=8; dv.setUint16(o,nTags,true); o+=2;
-  const tag=(id,type,cnt,val)=>{dv.setUint16(o,id,true);dv.setUint16(o+2,type,true);dv.setUint32(o+4,cnt,true);dv.setUint32(o+8,val,true);o+=12;};
-  tag(256,3,1,w); tag(257,3,1,h); tag(258,3,1,8); tag(259,3,1,1); tag(262,3,1,2);
-  tag(273,4,1,stripOff); tag(277,3,1,3); tag(278,3,1,h); tag(279,4,1,rgb.length); tag(284,3,1,1);
-  dv.setUint32(o,0,true);
-  u8.set(rgb,stripOff);
-  return new Blob([ab],{type:'image/tiff'});
-}
-function cvToBlob(cv,fmt){ if(fmt==='tiff') return Promise.resolve(tiffEncode(cv)); const mime=fmt==='jpeg'?'image/jpeg':fmt==='webp'?'image/webp':'image/png'; return new Promise(r=>cv.toBlob(r,mime,0.92)); }
-function saveBlob(blob,name){ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),4000); }
-
-
-async function exportPDF(canvases,items,mode,opts){
-  const { jsPDF }=window.jspdf; let pdf;
-  if(mode==='single'){ const cv=canvases[0]; pdf=new jsPDF({orientation:cv.width>cv.height?'l':'p',unit:'px',format:[cv.width,cv.height]}); pdf.addImage(cv.toDataURL('image/png'),'PNG',0,0,cv.width,cv.height); }
-  else { canvases.forEach((cv,i)=>{ if(i===0) pdf=new jsPDF({orientation:cv.width>cv.height?'l':'p',unit:'px',format:[cv.width,cv.height]}); else pdf.addPage([cv.width,cv.height], cv.width>cv.height?'l':'p'); pdf.addImage(cv.toDataURL('image/png'),'PNG',0,0,cv.width,cv.height); }); }
-  pdf.save('brush-previews.pdf');
-}
-function safe(s){return (s+'').replace(/[^\w.-]+/g,'_').slice(0,80);}
-
-/* ---------- shape + grain export ---------- */
-async function exportShapeGrain(){
-  const items=selected().filter(i=>i.shapeBlob||i.grainBlob); if(!items.length){ toast('No shape/grain in selection'); return; }
-  const zip=new JSZip();
-  for(const it of items){ const base=safe(it.name||'brush');
-    if(it.shapeBlob) zip.file(base+'_shape.png', it.shapeBlob);
-    if(it.grainBlob) zip.file(base+'_grain.png', it.grainBlob);
-  }
-  saveBlob(await zip.generateAsync({type:'blob'}),'shape-grain.zip'); toast('Exported shape/grain PNGs');
-}
-
-/* ---------- repackage: selected Procreate brushes → .brushset ---------- */
-function bplistWrite(obj){
-  // minimal bplist00 encoder for { string: (string | [string,...]) }
-  const objects=[]; const indexOf=new Map();
-  function add(v){ // returns index
-    if(typeof v==='string'){ if(indexOf.has('S:'+v))return indexOf.get('S:'+v); const i=objects.length; objects.push({t:'s',v}); indexOf.set('S:'+v,i); return i; }
-    if(Array.isArray(v)){ const refs=v.map(add); const i=objects.length; objects.push({t:'a',refs}); return i; }
-    // dict
-    const keys=Object.keys(v); const kr=keys.map(k=>add(k)); const vr=keys.map(k=>add(v[k])); const i=objects.length; objects.push({t:'d',kr,vr}); return i;
-  }
-  const top=add(obj);
-  // serialize
-  const chunks=[]; let pos=8; const offsets=[];
-  const enc=new TextEncoder();
-  function push(bytes){ chunks.push(bytes); pos+=bytes.length; }
-  // header
-  chunks.push(enc.encode('bplist00')); 
-  const refSize=objects.length<256?1:2;
-  function intBytes(n,sz){ const b=new Uint8Array(sz); for(let i=sz-1;i>=0;i--){b[i]=n&0xff;n>>=8;} return b; }
-  for(let i=0;i<objects.length;i++){ offsets[i]=pos; const o=objects[i];
-    if(o.t==='s'){ const sb=enc.encode(o.v); // ascii if all <128 else utf16
-      let ascii=true; for(const c of o.v) if(c.charCodeAt(0)>127){ascii=false;break;}
-      if(ascii){ const len=sb.length; if(len<15){push(Uint8Array.of(0x50|len));} else {push(Uint8Array.of(0x5f)); push(Uint8Array.of(0x10)); push(intBytes(len,1));} push(sb); }
-      else { const arr=[...o.v]; const len=arr.length; if(len<15){push(Uint8Array.of(0x60|len));} else {push(Uint8Array.of(0x6f));push(Uint8Array.of(0x10));push(intBytes(len,1));} const u=new Uint8Array(len*2); for(let j=0;j<len;j++){const cc=arr[j].charCodeAt(0);u[j*2]=cc>>8;u[j*2+1]=cc&0xff;} push(u); }
-    } else if(o.t==='a'){ const len=o.refs.length; if(len<15)push(Uint8Array.of(0xA0|len)); else {push(Uint8Array.of(0xAf));push(Uint8Array.of(0x10));push(intBytes(len,1));} for(const r of o.refs)push(intBytes(r,refSize)); }
-    else { const len=o.kr.length; if(len<15)push(Uint8Array.of(0xD0|len)); else {push(Uint8Array.of(0xDf));push(Uint8Array.of(0x10));push(intBytes(len,1));} for(const r of o.kr)push(intBytes(r,refSize)); for(const r of o.vr)push(intBytes(r,refSize)); }
-  }
-  const tableOff=pos; const offSize=tableOff<256?1:tableOff<65536?2:4;
-  for(let i=0;i<objects.length;i++) push(intBytes(offsets[i],offSize));
-  const trailer=new Uint8Array(32); trailer[6]=offSize; trailer[7]=refSize;
-  const dv=new DataView(trailer.buffer); dv.setBigUint64(8,BigInt(objects.length)); dv.setBigUint64(16,BigInt(top)); dv.setBigUint64(24,BigInt(tableOff));
-  chunks.push(trailer);
-  let totalLen=0; chunks.forEach(c=>totalLen+=c.length); const out=new Uint8Array(totalLen); let off=0; chunks.forEach(c=>{out.set(c,off);off+=c.length;});
-  return out;
-}
-async function packBrushset(){
-  const items=selected().filter(i=>i.type==='pro' && i.files); if(!items.length){ toast('Select Procreate brushes to package'); return; }
-  const name=($('#setName').value||'My Brushes').trim();
-  const zip=new JSZip(); const folders=[];
-  for(const it of items){ const folder=uid(); folders.push(folder);
-    for(const path in it.files){ const e=it.files[path]; zip.file(folder+'/'+path, await e.async('uint8array')); }
-  }
-  const plist=bplistWrite({ name, brushes:folders });
-  zip.file('brushset.plist', plist);
-  saveBlob(await zip.generateAsync({type:'blob'}), safe(name)+'.brushset');
-  toast('Packaged '+items.length+' brushes → '+name+'.brushset');
-}
-async function splitToBrush(){
-  const items=selected().filter(i=>i.type==='pro' && i.files); if(!items.length){ toast('Select Procreate brushes'); return; }
-  const zip=new JSZip();
-  for(const it of items){ const inner=new JSZip();
-    for(const path in it.files){ inner.file(path, await it.files[path].async('uint8array')); }
-    const bb=await inner.generateAsync({type:'uint8array'});
-    zip.file(safe(it.name||'brush')+'.brush', bb);
-  }
-  saveBlob(await zip.generateAsync({type:'blob'}), 'individual-brushes.zip');
-  toast('Exported '+items.length+' .brush files (zipped)');
-}
-
-/* ---------- .abr tips → PNG (the reliable Photoshop route) ---------- */
-async function abrTipsToPng(){
-  const items=selected().filter(i=>i.type==='abr' && i.shapeBlob); if(!items.length){ toast('Select decoded .abr brushes'); return; }
-  const zip=new JSZip();
-  for(const it of items){ zip.file(safe(it.name||'tip')+'.png', it.shapeBlob); }
-  saveBlob(await zip.generateAsync({type:'blob'}),'abr-tips.zip');
-  toast('Exported '+items.length+' tip PNGs — in Photoshop: Edit ▸ Define Brush Preset');
-}
-/* ---------- .abr → .brush (experimental, template-based) ---------- */
-async function abrToBrush(){
-  const abrs=selected().filter(i=>i.type==='abr' && i.shapeBlob);
-  const template=state.items.find(i=>i.type==='pro' && i.files && i.files['Brush.archive']);
-  if(!abrs.length){ toast('Select decoded .abr brushes'); return; }
-  if(!template){ toast('Load one Procreate .brush as a template first (see note)'); return; }
-  const zip=new JSZip();
-  for(const it of abrs){ const inner=new JSZip();
-    for(const path in template.files){ // copy template, swap shape
-      if(/Shape\.png$/i.test(path)) inner.file(path, await it.shapeBlob.arrayBuffer());
-      else inner.file(path, await template.files[path].async('uint8array'));
-    }
-    zip.file(safe(it.name||'converted')+'.brush', await inner.generateAsync({type:'uint8array'}));
-  }
-  saveBlob(await zip.generateAsync({type:'blob'}),'abr-to-brush.zip');
-  toast('Experimental: created .brush files using template engine — verify in Procreate');
-}
-
-
-
-/* ---------------- render (clean panel) ---------------- */
-function render(){
-  const g=$('#brush-grid'); g.innerHTML='';
-  const has=state.items.length>0;
-  $('#empty').style.display=has?'none':'block';
-  state.items.forEach(it=>{
-    const c=document.createElement('div'); c.className='card'+(it.selected?' sel':'');
-    const badge=it.type==='abr'?'<span class="badge abr">abr</span>':'<span class="badge pro">pro</span>';
-    const pic=it.thumbUrl?`<img src="${it.thumbUrl}">`:'<span class="none">no preview</span>';
-    c.innerHTML=`<div class="thumb">${badge}<div class="chk">✓</div>${pic}</div>
-      <div class="foot"><div style="flex:1;min-width:0"><div class="nm">${esc(it.name||'Brush')}</div><div class="src">${esc(it.source||'')}</div></div>
-      <div class="iconbtn" title="Brush info">i</div></div>`;
-    c.querySelector('.thumb').onclick=()=>{it.selected=!it.selected;render();};
-    c.querySelector('.chk').onclick=e=>{e.stopPropagation();it.selected=!it.selected;render();};
-    c.querySelector('.iconbtn').onclick=()=>openInfo(it);
-    g.appendChild(c);
+/* ── Lazy CDN loader (only fetch heavy libs when a relevant file is opened) ── */
+const _loaded = {};
+function loadScript(src) {
+  if (_loaded[src]) return _loaded[src];
+  _loaded[src] = new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = res; s.onerror = () => rej(new Error('blocked: ' + src));
+    document.head.appendChild(s);
   });
-  const sel=selected().length;
-  $('#loadedCount').textContent=state.items.length;
-  $('#selCount').textContent=sel;
-  $('#export-sub').textContent=sel+' selected';
-  $('#open-export').disabled=sel===0;
+  return _loaded[src];
 }
 
-/* ---------------- info modal ---------------- */
-function openInfo(it){
-  $('#info-title').textContent=it.name||'Brush';
-  const dates=Object.entries(it.dates||{}).map(([k,v])=>`<tr><td>${esc(k)}</td><td class="pval">${v.toLocaleString?v.toLocaleString():v}</td></tr>`).join('');
-  const modified=it.sourceModified?new Date(it.sourceModified).toLocaleString():'—';
-  const imgs=`
-    <div class="imgcell"><div class="cap">Preview</div><div class="pic ${it.thumbUrl?'':'none'}">${it.thumbUrl?`<img src="${it.thumbUrl}">`:'none'}</div></div>
-    <div class="imgcell"><div class="cap">Shape ${it.shapeUrl?`<a href="${it.shapeUrl}" download="${dl(it,'shape')}.png">save</a>`:''}</div><div class="pic ${it.shapeUrl?'':'none'}">${it.shapeUrl?`<img src="${it.shapeUrl}">`:'no shape'}</div></div>
-    <div class="imgcell"><div class="cap">Grain ${it.grainUrl?`<a href="${it.grainUrl}" download="${dl(it,'grain')}.png">save</a>`:''}</div><div class="pic ${it.grainUrl?'':'none'}">${it.grainUrl?`<img src="${it.grainUrl}">`:'no grain'}</div></div>`;
-  let meta=`<table class="meta-table">
-    <tr><td>Name</td><td class="pval">${esc(it.name||'—')}</td></tr>
-    <tr><td>Source file</td><td class="pval">${esc(it.source||'—')}</td></tr>
-    <tr><td>Type</td><td class="pval">${it.type==='abr'?'Photoshop .abr':'Procreate'}</td></tr>
-    <tr><td>File modified</td><td class="pval">${modified}</td></tr>
-    ${it.abrW?`<tr><td>Tip size</td><td class="pval">${it.abrW}×${it.abrH}px</td></tr>`:''}${dates}`;
-  if(it.params){ for(const panel in it.params){ meta+=`<tr class="panelhdr"><td colspan="2">${esc(panel)}</td></tr>`;
-    for(const p of it.params[panel]) meta+=`<tr><td>${esc(p.setting)}</td><td class="pval">${esc(p.value)}${p.gui?` <span class="praw">${esc(p.gui)}</span>`:''}</td></tr>`; } }
-  else if(it.type!=='abr') meta+=`<tr><td colspan="2" style="color:var(--faint)">Parameters couldn't be decoded.</td></tr>`;
-  meta+=`</table>`;
-  $('#info-body').innerHTML=`<div class="imgrow">${imgs}</div>${meta}`;
-  openModal('info-modal');
+/** .psd → composite canvas via ag-psd. */
+async function parsePsd(buf) {
+  await loadScript('https://cdn.jsdelivr.net/npm/ag-psd@latest/dist/bundle.js');
+  const psd = window.agPsd.readPsd(buf, { skipLayerImageData: true, skipThumbnail: false });
+  const cv = psd.canvas || (psd.imageData ? null : null);
+  if (!cv) throw new Error('No composite image stored in this PSD.');
+  return { canvas: cv, w: psd.width, h: psd.height };
 }
 
-/* ---------------- image export (reads tiles) ---------------- */
-async function exportImages(){
-  const items=selected(); if(!items.length){toast('Select some brushes first');return;}
-  const opts={tile:Math.max(64,Math.min(2048,parseInt($('#optTile').value)||512)),
-              gap:Math.max(0,parseInt($('#optGap').value)||0),
-              caption:$('#optCaption').checked, bg:$('#optBg').checked};
-  const layout=document.querySelector('input[name=xlayout]:checked').value;
-  const fmt=document.querySelector('input[name=xfmt]:checked').value;
-  toast('Rendering…');
-  const tiles=[]; for(const it of items) tiles.push(await renderTile(it,opts));
-  if(layout==='separate'){
-    if(fmt==='pdf'){ await exportPDF(tiles,items,'grid',opts); }
-    else{ const zip=new JSZip();
-      for(let i=0;i<tiles.length;i++){const b=await cvToBlob(tiles[i],fmt);zip.file(safe(items[i].name||('brush'+i))+'.'+(fmt==='jpeg'?'jpg':fmt),b);}
-      saveBlob(await zip.generateAsync({type:'blob'}),'brush-previews.zip'); }
-  } else {
-    const n=tiles.length,S=opts.tile,gp=opts.gap; let cols,rows;
-    if(layout==='vertical'){cols=1;rows=n;} else if(layout==='horizontal'){cols=n;rows=1;} else {cols=Math.ceil(Math.sqrt(n));rows=Math.ceil(n/cols);}
-    const cv=document.createElement('canvas');cv.width=cols*S+(cols-1)*gp;cv.height=rows*S+(rows-1)*gp;
-    const ctx=cv.getContext('2d'); if(opts.bg){ctx.fillStyle='#fff';ctx.fillRect(0,0,cv.width,cv.height);}
-    tiles.forEach((t,i)=>{const cx=i%cols,cy=Math.floor(i/cols);ctx.drawImage(t,cx*(S+gp),cy*(S+gp));});
-    if(fmt==='pdf'){ await exportPDF([cv],items,'single',opts); }
-    else saveBlob(await cvToBlob(cv,fmt),'brush-sheet.'+(fmt==='jpeg'?'jpg':fmt));
+/* ════════════════════════ RENDER LAYER (DOM) ════════════════════════ */
+
+const out = document.getElementById('out');
+
+function card(name, tag) {
+  const c = document.createElement('div'); c.className = 'card';
+  c.innerHTML = `<div class="card-head"><span class="name">${escapeHtml(name)}</span><span class="tag">${tag}</span></div><div class="card-body"></div>`;
+  out.prepend(c);
+  return c.querySelector('.card-body');
+}
+function escapeHtml(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function loading(body){ body.innerHTML = '<span class="spin"></span><span class="note">reading…</span>'; }
+function fail(body, msg){ body.innerHTML = `<span class="err">⚠ ${escapeHtml(msg)}</span>`; }
+
+async function handleFile(file) {
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  const body = card(file.name, ext);
+  loading(body);
+  try {
+    const buf = await file.arrayBuffer();
+    if (ext === 'procreate' || ext === 'brush') {
+      const { blobUrl } = await parseProcreateThumb(buf);
+      body.innerHTML = `<div class="checker"><img src="${blobUrl}" alt=""></div><div class="meta">Embedded <b>QuickLook</b> preview · ${(file.size/1048576).toFixed(1)} MB file</div>`;
+    } else if (ext === 'brushset') {
+      const brushes = await parseBrushset(buf);
+      const cells = brushes.map(b => `<div class="cell"><img src="${b.blobUrl}" alt=""></div>`).join('');
+      body.innerHTML = `<div class="grid">${cells}</div><div class="meta"><b>${brushes.length}</b> brushes</div>`;
+    } else if (ext === 'swatches') {
+      const { name, colors } = await parseSwatches(buf);
+      const cells = colors.map(hex => hex
+        ? `<div class="swatch"><div class="chipcolor" style="background:${hex}"></div><div class="hex">${hex}</div></div>`
+        : `<div class="swatch"><div class="chipcolor checker" style="height:58px"></div><div class="hex">empty</div></div>`
+      ).join('');
+      body.innerHTML = `<div class="swatches">${cells}</div><div class="meta">Palette <b>${escapeHtml(name)}</b> · ${colors.filter(Boolean).length} colors <span class="note">(sRGB approximation — original ICC profile not applied)</span></div>`;
+    } else if (ext === 'psd') {
+      const { canvas, w, h } = await parsePsd(buf);
+      const wrap = document.createElement('div'); wrap.className = 'checker';
+      wrap.appendChild(canvas); body.innerHTML = ''; body.appendChild(wrap);
+      const m = document.createElement('div'); m.className = 'meta';
+      m.innerHTML = `Composite preview · <b>${w}×${h}</b>`; body.appendChild(m);
+    } else if (ext === 'ai') {
+      await renderAi(buf, body);
+    } else {
+      fail(body, 'Unsupported extension.');
+    }
+  } catch (e) {
+    fail(body, e.message + (/blocked/.test(e.message) ? ' — this CDN is blocked in the in-chat sandbox but works when you self-host the file.' : ''));
   }
-  toast(items.length+' brush(es) exported');
 }
 
-/* ---------------- wiring ---------------- */
-function openModal(id){document.getElementById(id).classList.add('show');}
-function closeModal(m){m&&m.classList.remove('show');}
-$$('[data-open]').forEach(b=>b.addEventListener('click',()=>openModal(b.dataset.open)));
-$$('[data-close]').forEach(b=>b.addEventListener('click',()=>closeModal(b.closest('.modal'))));
-$$('.modal').forEach(m=>m.addEventListener('click',e=>{if(e.target.classList.contains('modal-backdrop'))closeModal(m);}));
-document.addEventListener('keydown',e=>{if(e.key==='Escape')$$('.modal.show').forEach(closeModal);});
+/** Modern .ai files are PDF-compatible; render page 1 with pdf.js. */
+async function renderAi(buf, body) {
+  await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
+  const pdfjs = window.pdfjsLib;
+  pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  const doc = await pdfjs.getDocument({ data: buf }).promise;
+  const page = await doc.getPage(1);
+  const vp = page.getViewport({ scale: 1.5 });
+  const cv = document.createElement('canvas');
+  cv.width = vp.width; cv.height = vp.height;
+  await page.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
+  const wrap = document.createElement('div'); wrap.className = 'checker';
+  wrap.appendChild(cv); body.innerHTML = ''; body.appendChild(wrap);
+  const m = document.createElement('div'); m.className='meta'; m.innerHTML = 'Rendered via PDF-compatible layer'; body.appendChild(m);
+}
 
-const dz=$('#dropzone'), input=$('#file-input');
-dz.onclick=()=>input.click();
-dz.onkeydown=e=>{if(e.key==='Enter'||e.key===' ')input.click();};
-input.onchange=async e=>{await ingest([...e.target.files]); closeModal($('#import-modal'));};
-['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag');}));
-['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('drag');}));
-dz.addEventListener('drop',async e=>{await ingest([...e.dataTransfer.files]); closeModal($('#import-modal'));});
-$('#emptyImport').onclick=()=>openModal('import-modal');
-
-$('#selAll').onclick=()=>{state.items.forEach(i=>i.selected=true);render();};
-$('#selNone').onclick=()=>{state.items.forEach(i=>i.selected=false);render();};
-$('#selPro').onclick=()=>{state.items.forEach(i=>i.selected=(i.type==='pro'));render();};
-$('#clearAll').onclick=()=>{state.items=[];render();};
-
-$('#fontseg').querySelectorAll('.opt').forEach(o=>o.onclick=()=>{$('#fontseg').querySelectorAll('.opt').forEach(x=>x.classList.remove('on'));o.classList.add('on');document.documentElement.style.setProperty('--fs',o.dataset.fs+'px');});
-
-$('#doExportImg').onclick=exportImages;
-$('#doExportShapeGrain').onclick=exportShapeGrain;
-$('#doSplitBrush').onclick=splitToBrush;
-$('#doPackBrushset').onclick=packBrushset;
-$('#doAbrTip').onclick=abrTipsToPng;
-$('#doAbrToBrush').onclick=abrToBrush;
-
-render();
+/* ════════════════════════ INPUT WIRING ════════════════════════ */
+const drop = document.getElementById('drop');
+const input = document.getElementById('file');
+drop.addEventListener('click', () => input.click());
+drop.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') input.click(); });
+input.addEventListener('change', e => [...e.target.files].forEach(handleFile));
+['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drag'); }));
+['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('drag'); }));
+drop.addEventListener('drop', e => [...e.dataTransfer.files].forEach(handleFile));
 </script>
 </body>
 </html>
