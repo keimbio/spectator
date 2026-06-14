@@ -1,4 +1,4 @@
-# Spectator
+# ₊°˖.⟡ ݁. Spectator – Brush Studio⋆°.⊹ ݁₊*。݁
 
 A single-file, client-side previewer & packager for Procreate (`.brush`, `.brushset`) and
 Photoshop (`.abr`) brushes. Everything runs in your browser — files are never uploaded.
