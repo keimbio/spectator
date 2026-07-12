@@ -1,4 +1,4 @@
-# Spectator
+# ₊°˖.⟡ ݁. Spectator – Brush Studio⋆°.⊹ ݁₊*。݁
 
 A single-file, client-side previewer & packager for Procreate (`.brush`, `.brushset`) and
 Photoshop (`.abr`) brushes. Everything runs in your browser — files are never uploaded.
@@ -12,7 +12,8 @@ Edit two constants near the top of the `<script>` to point the footer at your re
 
 ## Features
 - Batch-load `.brush`, `.brushset`, `.abr` — click the Brushes box or drag & drop onto it.
-- **Brushset order and names are preserved** exactly as stored in the set.
+- **Brushset order and names are preserved** exactly as stored in the set
+  (both XML and binary `brushset.plist` formats are supported).
 - **Dual brushes** stay intact (not split); their secondary shape/grain appear in the info panel.
 - Grid / Stack views with adjustable column count.
 - Info panel: name, source, dates, decoded Procreate parameters, plus Preview / Shape / Grain
@@ -27,9 +28,9 @@ Edit two constants near the top of the `<script>` to point the footer at your re
 - Writing real `.abr` files isn't reliably possible in-browser (the newer format isn't fully
   documented); use the PNG-tip route for Photoshop. See `CREDITS.md`.
 - License: MIT (see `LICENSE`). 
-- See `CHANGELOG.md` for release history.
 
-Attribution for the embedded parameter schema:
+See `CHANGELOG.md` for release history.
+
 # Credits & third-party notices — Spectator
 
 Spectator is released under the MIT License (see `LICENSE`). It is an original implementation,
@@ -67,5 +68,4 @@ projects' licenses do not attach to Spectator. Credited out of respect.
 
 Photoshop `.abr` parsing is based on the publicly documented format
 (http://fileformats.archiveteam.org/wiki/Photoshop_brush) and Adobe's file-format specification.
-
-
+- Attribution for the embedded parameter schema is also found in `CREDITS.md`.

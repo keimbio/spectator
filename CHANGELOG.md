@@ -3,19 +3,30 @@
 All notable changes to Spectator are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/); versioning follows [SemVer](https://semver.org/).
 
+## [3.2.1] - 2026-07-12
+
+### Fixed
+- **Brushes from a `.brushset` now load in the set's true order.** Procreate writes
+  `brushset.plist` as an **XML** plist, while `Brush.archive` inside each brush folder is a
+  **binary** plist. Spectator only had a binary-plist reader, so parsing `brushset.plist` threw,
+  the brush order silently fell back to ZIP central-directory order (which is arbitrary), and
+  brushes appeared shuffled. Brush *names* still worked, which masked the failure — they come
+  from the binary `Brush.archive`, not the manifest.
+- Added an XML plist parser. `brushset.plist` is now sniffed by header (`bplist00` vs `<?xml`)
+  and read with the appropriate parser, so both formats are handled.
+
+### Added
+- Logo displayed beneath the site credit in the footer.
+
+### Changed
+- Version bumped to 3.2.1.
+
 ## [1.0.1] - 2026-07-12
 
 ### Fixed
-- **Brushes from a `.brushset` now load in the set's real order.** `brushset.plist` is written in
-  two different shapes: a plain plist (`{name, brushes:[...]}`) and an `NSKeyedArchiver` archive
-  (where `brushes` is an `NS.objects` array of UID references). Only the first shape was handled,
-  so archived sets silently fell back to ZIP central-directory order — which is arbitrary, and
-  showed brushes shuffled (e.g. 4, 2, 1, 3). Both shapes are now parsed, and UID entries are
-  dereferenced to their folder names.
-- `brushset.plist` is now located case-insensitively.
-- Brush folders present in the archive but missing from `brushset.plist` are appended at the end
-  instead of being dropped.
-- If the order can't be read, a warning is logged to the console rather than failing silently.
+- Handled `NSKeyedArchiver`-wrapped `brushset.plist` (where `brushes` is an `NS.objects` array of
+  UID references) in addition to the plain form; case-insensitive manifest lookup; brush folders
+  missing from the manifest are appended rather than dropped.
 
 ## [1.0.0] - 2026-06-14
 
